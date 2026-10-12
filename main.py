@@ -1,6 +1,7 @@
 import os
 import json
 import time
+import random
 import asyncio
 import discord
 from discord import app_commands
@@ -9,6 +10,7 @@ from discord.ext import tasks
 TOKEN = os.getenv("DISCORD_TOKEN")  # ใส่ในช่อง Environment ของโฮสต์ ห้ามเขียนทับในโค้ด
 CONFIG_FILE = "tagrole_config.json"
 STATE_FILE = "tagrole_state.json"
+MSG_FILE = "tagrole_msgs.json"
 
 DEFAULT_CONFIG = {
     "role_id": None,
@@ -44,6 +46,9 @@ def save(path, data):
 
 config = load(CONFIG_FILE, DEFAULT_CONFIG)
 granted = set(load(STATE_FILE, []))  # id คนที่บอทเป็นคนให้ยศ (กันลบยศที่แอดมินแจกเอง)
+
+
+msgs = load(MSG_FILE, {})  # id คน -> [ห้อง, ข้อความ] ของข้อความคืนยศล่าสุด
 
 
 def save_state():
@@ -89,16 +94,40 @@ def make_embed(title: str, text: str, member: discord.Member) -> discord.Embed:
 
 async def announce(guild: discord.Guild, member: discord.Member, title: str, text: str):
     if not config["channel_id"]:
-        return
+        return None
     ch = guild.get_channel(config["channel_id"])
     if ch is None:
-        return
+        return None
+    # กันซ้ำข้ามอินสแตนซ์: ถ้าบอทเพิ่งส่งข้อความหัวข้อเดียวกันถึงคนนี้ใน 30 วินาที ไม่ส่งอีก
     try:
-        await ch.send(
+        async for m in ch.history(limit=10):
+            if (
+                m.author.id == bot.user.id
+                and m.embeds
+                and m.embeds[0].title == title
+                and member.mention in (m.content or "")
+                and (discord.utils.utcnow() - m.created_at).total_seconds() < 30
+            ):
+                return None
+    except discord.HTTPException:
+        pass
+    try:
+        return await ch.send(
             content=member.mention,
             embed=make_embed(title, text, member),
             allowed_mentions=discord.AllowedMentions(users=[member], roles=False),
         )
+    except discord.HTTPException:
+        return None
+
+
+async def delete_old(guild: discord.Guild, ref):
+    ch = guild.get_channel(ref[0])
+    if ch is None:
+        return
+    try:
+        m = await ch.fetch_message(ref[1])
+        await m.delete()
     except discord.HTTPException:
         pass
 
@@ -126,6 +155,17 @@ async def _check_member(member: discord.Member):
 
     wants = has_tag(member, guild)
     owns = role in member.roles
+    needs_action = (wants and not owns) or (not wants and owns and member.id in granted)
+
+    if needs_action:
+        # หน่วงสุ่มสั้น ๆ แล้วดึงข้อมูลสดอีกรอบ กันกรณีมีบอทหลายตัวทำงานพร้อมกัน
+        await asyncio.sleep(random.uniform(0, 1.5))
+        try:
+            member = await guild.fetch_member(member.id)
+        except discord.HTTPException:
+            return
+        wants = has_tag(member, guild)
+        owns = role in member.roles
 
     if wants and not owns:
         try:
@@ -135,6 +175,11 @@ async def _check_member(member: discord.Member):
         granted.add(member.id)
         last_action[member.id] = time.time()
         save_state()
+        # ลบข้อความ "คืนยศ" เก่าของคนนี้ออก
+        old = msgs.pop(str(member.id), None)
+        if old:
+            save(MSG_FILE, msgs)
+            await delete_old(guild, old)
         await announce(guild, member, config["give_title"], fmt(config["give_msg"], member, role))
 
     elif wants and owns:
@@ -150,7 +195,10 @@ async def _check_member(member: discord.Member):
         granted.discard(member.id)
         last_action[member.id] = time.time()
         save_state()
-        await announce(guild, member, config["remove_title"], fmt(config["remove_msg"], member, role))
+        sent = await announce(guild, member, config["remove_title"], fmt(config["remove_msg"], member, role))
+        if sent:
+            msgs[str(member.id)] = [sent.channel.id, sent.id]
+            save(MSG_FILE, msgs)
 
 
 @bot.event
