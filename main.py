@@ -1,5 +1,7 @@
 import os
 import json
+import time
+import asyncio
 import discord
 from discord import app_commands
 from discord.ext import tasks
@@ -101,8 +103,21 @@ async def announce(guild: discord.Guild, member: discord.Member, title: str, tex
         pass
 
 
+locks = {}
+last_action = {}
+
+
 async def check_member(member: discord.Member):
+    # กันอีเวนต์หลายตัวเรียกพร้อมกันจนส่งข้อความซ้ำ
+    lock = locks.setdefault(member.id, asyncio.Lock())
+    async with lock:
+        await _check_member(member)
+
+
+async def _check_member(member: discord.Member):
     if member.bot or not config["role_id"]:
+        return
+    if time.time() - last_action.get(member.id, 0) < 15:
         return
     guild = member.guild
     role = guild.get_role(config["role_id"])
@@ -118,6 +133,7 @@ async def check_member(member: discord.Member):
         except discord.HTTPException:
             return
         granted.add(member.id)
+        last_action[member.id] = time.time()
         save_state()
         await announce(guild, member, config["give_title"], fmt(config["give_msg"], member, role))
 
@@ -132,6 +148,7 @@ async def check_member(member: discord.Member):
         except discord.HTTPException:
             return
         granted.discard(member.id)
+        last_action[member.id] = time.time()
         save_state()
         await announce(guild, member, config["remove_title"], fmt(config["remove_msg"], member, role))
 
